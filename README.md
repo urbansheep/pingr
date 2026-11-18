@@ -35,14 +35,15 @@ Keys: `1` `2` `3` zoom (10 min per second · 1 h per minute · 24 h per hour),
 ## Screen
 
 ```
-pingr 00:31:30  en0 192.168.1.9  gw 192.168.1.1  route utun4  ts exit urbansheep-vu
-ok  route=utun4 gw=en0/192.168.1.1
+pingr 00:31:30  wlan0 192.0.2.9  gw 192.0.2.1  route tun0  ts exit urbansheep-vu
+ok  route=tun0 gw=wlan0/192.0.2.1
 
-lan   192.168.1.1         14ms    +1ms    0%   ................................x
-wan1  1.1.1.1             72ms   +17ms    2%   o..o.o.o...oo.oo.oooooo.ooooo.o.x
-wan2  9.9.9.9             37ms   -23ms    2%   ooo.oooooooo.ooooooooo..o.oooooox
-http1 www.gstatic.com    334ms   +11ms    0%      . .. . .. . .. . .. . .. . .. .
-http2 cp.cloudflare.co   365ms    +4ms    0%    . .. . .. . .. . .. . .. . o. .
+lan   192.0.2.1           14ms    +1ms    0%   ................................x
+wan1  198.51.100.1        72ms   +17ms    2%   o..o.o.o...oo.oo.oooooo.ooooo.o.x
+wan2  203.0.113.9         37ms   -23ms    2%   ooo.oooooooo.ooooooooo..o.oooooox
+http1 a.example.net      334ms   +11ms    0%      . .. . .. . .. . .. . .. . .. .
+http2 b.example.net      365ms    +4ms    0%    . .. . .. . .. . .. . .. . o. .
+. o O @ latency low-high   x lost   │ network change   ~ sleep gap
 ```
 
 Per row: current sample, Δ against the last hour's median, loss over 60 s (300 s for HTTP),
@@ -66,7 +67,7 @@ containing a peak above the red bin is drawn red anyway, so spikes are never ave
 | `no route` | `route -n get default` yields no interface |
 | `no gateway` | route exists but no active port has a DHCP router |
 | `LAN down` | router lost 3 consecutive probes |
-| `uplink down` | both `1.1.1.1` and `9.9.9.9` lost 3 consecutive probes |
+| `uplink down` | both public anchors lost 3 consecutive probes |
 | `HTTP blocked` | both 204 endpoints failed twice in a row |
 | `ok` | none of the above |
 
@@ -80,9 +81,9 @@ sample is treated as noise (Wi-Fi drops plenty); three in a row is an outage.
 - Network parameters (`route -n get default`, `ipconfig getoption <dev> router`, hardware-port
   scan as fallback) are re-read every 5 s. A changed gateway/route is adopted only after two
   identical reads, then all pingers restart and a `│` marker is written.
-- HTTP: `GET /generate_204` against `www.gstatic.com` and `cp.cloudflare.com` every 30 s,
+- HTTP: `GET /generate_204` against two public endpoints every 30 s,
   measuring time-to-first-byte. That says the path works, not how fast it is.
-- Throughput on demand: 10 MB from `speed.cloudflare.com`, reported as Mbps in the footer.
+- Throughput on demand: 10 MB from a public speed-test endpoint, reported as Mbps in the footer.
 
 ## Files
 

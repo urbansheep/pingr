@@ -35,7 +35,7 @@ but needs root on macOS and crashes when the network changes.
 | 2 | Language | Python 3 + stdlib `curses`; Go/Rust rejected because ICMP needs a subprocess either way and curses is free |
 | 3 | Sampling | `/sbin/ping -i 1 -W 900` per ICMP target (macOS blocks unprivileged ICMP sockets from scripts) |
 | 4 | Self-heal | Re-resolve only; report `no route`/`no gateway` with a since-time; no privileged remediation |
-| 5 | Targets | Router + `1.1.1.1` + `9.9.9.9` + `www.gstatic.com/generate_204` + `cp.cloudflare.com/generate_204` |
+| 5 | Targets | Router + two public DNS anchors + two `generate_204` HTTP endpoints |
 | 6 | HTTP semantics | 30 s TTFB probes are a liveness/latency signal, not throughput; real throughput is a manual `t` keypress (10 MB) |
 | 7 | Layout | mtr-style rows per target, one active zoom, other zooms compressed to two bottom rows for the worst target |
 | 8 | Colour | Fixed bins per target class, calibrated on real medians, plus a Δ-vs-hour-median column |
@@ -96,7 +96,7 @@ bucket at 120 columns and 1 s buckets are only possible when 600 columns fit.
 no route      route -n get default yields no interface
 no gateway    route exists, but no active port reports a DHCP router
 LAN down      router lost 3 consecutive samples
-uplink down   1.1.1.1 and 9.9.9.9 both lost 3 consecutive samples
+uplink down   both public anchors lost 3 consecutive samples
 HTTP blocked  both 204 endpoints failed twice in a row
 ok            otherwise
 ```
