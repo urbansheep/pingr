@@ -104,7 +104,9 @@ def recent(st, name, k=DOWN_AFTER):
 
 
 def compute_mode(st):
-    """Three consecutive losses on the router or on both anchors = the path is down."""
+    """Three consecutive losses on the router = the LAN is down. Both anchors lost
+    means the uplink is down — unless HTTP still answers, in which case only ICMP
+    is being filtered (common behind Tailscale exit nodes)."""
     def lost(seq):
         return len(seq) == DOWN_AFTER and all(v is None for v in seq)
     if st.route_dev is None:
@@ -114,6 +116,9 @@ def compute_mode(st):
     if lost(recent(st, "lan")):
         return "LAN down"
     if lost(recent(st, "wan1")) and lost(recent(st, "wan2")):
+        http_down = all(st.http_fail[n] >= 2 for n in HTTP)
+        if st.http_enabled and not http_down:
+            return "ICMP filtered"
         return "uplink down"
     if all(st.http_fail[n] >= 2 for n in HTTP):
         return "HTTP blocked"
@@ -658,6 +663,18 @@ def selftest():
     st.gw = None
     assert compute_mode(st) == "no gateway"
     assert bucketize([(now, 10.0)], now, 60, 3)[2][0] == 10.0
+    st.dev, st.gw, st.route_dev = "en0", "192.168.1.1", "en0"
+    st.series["lan"].append((now, 5.0))
+    st.series["wan1"].extend([(now - 2 + i, None) for i in range(3)])
+    st.series["wan2"].extend([(now - 2 + i, None) for i in range(3)])
+    assert compute_mode(st) == "ICMP filtered"  # anchors dead, HTTP alive
+    st.http_fail = {n: 0 if n == "gstatic" else 2 for n in HTTP}
+    assert compute_mode(st) == "ICMP filtered"  # one endpoint alive is enough
+    st.http_fail = {n: 2 for n in HTTP}
+    assert compute_mode(st) == "uplink down"  # ICMP and HTTP both dead
+    st.http_fail = {n: 0 for n in HTTP}
+    st.http_enabled = False
+    assert compute_mode(st) == "uplink down"  # no HTTP evidence without probes
     print("selftest ok")
 
 

@@ -41,7 +41,7 @@ but needs root on macOS and crashes when the network changes.
 | 8 | Colour | Fixed bins per target class, calibrated on real medians, plus a Δ-vs-hour-median column |
 | 9 | Persistence | Per-minute aggregates to disk (24 h), per-second history in memory (1 h) |
 | 10 | Install | `~/.local/bin/pingr`, old function deleted from both zsh files, copy in `~/scripts/pingr-legacy.zsh` |
-| 11 | Down rule | 3 consecutive losses on a target; one loss is noise |
+| 11 | Down rule | 3 consecutive losses on a target; one loss is noise. Both anchors lost + HTTP alive = `ICMP filtered`, not `uplink down` |
 | 12 | Discontinuities | Gateway change → `│` marker; sample gap > 5 s → `~`, excluded from loss counting |
 | 13 | CLI | `-q`, `-1`, `--ascii`, `--no-http`; non-TTY stdout implies `-q` |
 | 14 | Keys | `1/2/3`, `t`, `s`, `p`, `r`, `?`, `q` |
@@ -99,7 +99,8 @@ bucket at 120 columns and 1 s buckets are only possible when 600 columns fit.
 no route      route -n get default yields no interface
 no gateway    route exists, but no active port reports a DHCP router
 LAN down      router lost 3 consecutive samples
-uplink down   both public anchors lost 3 consecutive samples
+ICMP filtered both anchors lost 3 samples but a 204 endpoint still answers
+uplink down   both anchors lost 3 samples and HTTP is failing too (or --no-http)
 HTTP blocked  both 204 endpoints failed twice in a row
 ok            otherwise
 ```

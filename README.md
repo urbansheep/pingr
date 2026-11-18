@@ -71,7 +71,8 @@ Colour follows the **median** of each time bucket against per-class bins; a buck
 | `no route` | `route -n get default` yields no interface |
 | `no gateway` | route exists but no active port has a DHCP router |
 | `LAN down` | router lost 3 consecutive probes |
-| `uplink down` | both public anchors lost 3 consecutive probes |
+| `uplink down` | both public anchors lost 3 consecutive probes (and HTTP is failing too, or `--no-http`) |
+| `ICMP filtered` | both anchors lost 3 consecutive probes but at least one 204 endpoint still answers — the path works, ping replies are being dropped |
 | `HTTP blocked` | both 204 endpoints failed twice in a row |
 | `ok` | none of the above |
 
