@@ -36,8 +36,8 @@ but needs root on macOS and crashes when the network changes.
 | 3 | Sampling | `/sbin/ping -i 1 -W 900` per ICMP target (macOS blocks unprivileged ICMP sockets from scripts) |
 | 4 | Self-heal | Re-resolve only; report `no route`/`no gateway` with a since-time; no privileged remediation |
 | 5 | Targets | Router + two public DNS anchors + two `generate_204` HTTP endpoints |
-| 6 | HTTP semantics | 30 s TTFB probes are a liveness/latency signal, not throughput; real throughput is a manual `t` keypress (10 MB) |
-| 7 | Layout | mtr-style rows per target, one active zoom, other zooms compressed to two bottom rows for the worst target |
+| 6 | HTTP semantics | 30 s TTFB probes are a liveness/latency signal, not throughput; real throughput is a manual `t` keypress (10 MB from `speed.cloudflare.com/__down`) |
+| 7 | Layout | mtr-style rows per target, one active zoom, other zooms compressed to two bottom rows for the worst target; footer legend repeats the glyphs in their graph colours |
 | 8 | Colour | Fixed bins per target class, calibrated on real medians, plus a Δ-vs-hour-median column |
 | 9 | Persistence | Per-minute aggregates to disk (24 h), per-second history in memory (1 h) |
 | 10 | Install | `~/.local/bin/pingr`, old function deleted from both zsh files, copy in `~/scripts/pingr-legacy.zsh` |
@@ -57,10 +57,13 @@ Four kinds of threads plus the renderer, all sharing one `State` guarded by a `L
   recomputes per-target hour medians, persists minute aggregates every 10 s.
 - **pinger ×3**: one per ICMP target. Holds a `ping` subprocess, parses `time=` and
   `Request timeout` lines, records `(timestamp, rtt | None)`. Restarts when `State.gen`
-  changes (network change, manual `r`, gap) or when the target disappears.
+  changes (network change, manual `r`, gap) or when the target disappears. Every live
+  subprocess is registered in `State.procs` so exit kills them all — no orphaned `ping`.
+- **renderer**: `curses` loop at 5 Hz; redraws from a snapshot taken under the lock.
+  Draws a footer legend with each glyph in its graph colour; below 40×10 it shows a
+  "terminal too small" notice instead of crashing.
 - **http_probe**: sequentially fetches both 204 endpoints every 30 s, records TTFB or `None`,
   maintains consecutive-failure counters.
-- **renderer**: `curses` loop at 5 Hz; redraws from a snapshot taken under the lock.
 
 ### Data model
 
@@ -146,6 +149,6 @@ Irrelevant for a trend view; revisit only if exact totals ever matter.
 - Colour bins are calibrated to one network (Wi-Fi through a Tailscale exit node). Wired or a
   nearer exit node needs lower `BINS` values.
 - `p` stops ICMP sampling but an in-flight HTTP probe or a 30 s wait finishes first.
-- The Tailscale exit node is resolved by matching `ExitNodeStatus.ID` against peer IDs; a
+- The Tailscale exit node is resolved by exact-matching `ExitNodeStatus.ID` against peer IDs; a
   Tailscale change to that JSON shape degrades to "no ts exit", not to an error.
 - Terminal narrower than ~60 columns truncates the stats column; the graph still renders.
