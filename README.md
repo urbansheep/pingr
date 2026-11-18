@@ -10,7 +10,13 @@ cd pingr
 ./install.sh   # copies pingr to ~/.local/bin, runs the self-test
 ```
 
-Requires macOS with stock Python 3. No dependencies, no config files.
+Requires macOS with stock Python 3. No dependencies, no config files, no sudo.
+`~/.local/bin` is the standard per-user location; macOS leaves it off `PATH` by
+default, so if `pingr` is not found after install, add this to `~/.zshrc`:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
 
 Live command: `~/.local/bin/pingr`
 
