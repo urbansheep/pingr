@@ -1,0 +1,689 @@
+#!/usr/bin/env python3
+"""pingr - one-screen latency monitor for LAN, uplink and HTTP reachability.
+
+ICMP is sampled through /sbin/ping subprocesses: macOS refuses unprivileged ICMP
+sockets to scripts, and mtr would need root. The pingers are restarted whenever the
+default route or the router changes, so nothing goes stale after a network switch.
+"""
+import argparse
+import curses
+import http.client
+import json
+import os
+import re
+import ssl
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
+from pathlib import Path
+
+PING = "/sbin/ping"
+TS_BIN = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+LOG = Path.home() / "Library/Logs/pingr.log"
+HIST = Path.home() / "Library/Application Support/pingr/history.json"
+
+NAMES = ("lan", "wan1", "wan2", "gstatic", "cloudflare")
+ADDR = {"wan1": "1.1.1.1", "wan2": "9.9.9.9"}
+HTTP = {"gstatic": ("www.gstatic.com", "/generate_204"),
+        "cloudflare": ("cp.cloudflare.com", "/generate_204")}
+HOPS = ("lan", "wan1", "wan2")
+BINS = {"lan": (20, 60, 150), "wan": (120, 250, 500), "http": (600, 1200, 2500)}
+GLYPHS = (".", "o", "O", "@")
+ASCII_GLYPHS = (".", ":", "+", "!")
+ZOOMS = ((600, "10m/s"), (3600, "1h/m"), (86400, "24h/h"))
+MAXLEN = {"lan": 3600, "wan1": 3600, "wan2": 3600, "gstatic": 120, "cloudflare": 120}
+DOWN_AFTER = 3          # consecutive losses before a target counts as down
+RESOLVE_EVERY = 5       # seconds between network parameter reads
+CONFIRM = 2             # identical reads needed before adopting a changed gateway
+
+
+def cls_of(name):
+    return "http" if name in HTTP else ("lan" if name == "lan" else "wan")
+
+
+def log(msg):
+    try:
+        LOG.parent.mkdir(parents=True, exist_ok=True)
+        if LOG.exists() and LOG.stat().st_size > 1_000_000:
+            os.replace(LOG, LOG.with_name("pingr.log.1"))
+        with LOG.open("a") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + msg + "\n")
+    except OSError:
+        pass
+
+
+def run(cmd, timeout=5):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def hardware_devices():
+    return re.findall(r"Device: (\S+)", run(["networksetup", "-listallhardwareports"]))
+
+
+def resolve():
+    """(gateway device, router, default-route device). Falls back to any port with both,
+    because the default route often points at a tunnel that has no router of its own."""
+    route_dev = re.search(r"interface:\s*(\S+)", run(["route", "-n", "get", "default"]))
+    route_dev = route_dev.group(1) if route_dev else None
+    if route_dev:
+        gw = run(["ipconfig", "getoption", route_dev, "router"]).strip()
+        if gw:
+            return route_dev, gw, route_dev
+    for cand in hardware_devices():
+        gw = run(["ipconfig", "getoption", cand, "router"]).strip()
+        if gw and run(["ipconfig", "getifaddr", cand]).strip():
+            return cand, gw, route_dev
+    return None, None, route_dev
+
+
+class State:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.series = {n: deque(maxlen=MAXLEN[n]) for n in NAMES}
+        self.http_fail = {n: 0 for n in HTTP}
+        self.minutes = {n: {} for n in NAMES}
+        self.dev = self.gw = self.ip = self.ts_exit = self.route_dev = None
+        self.mode, self.since, self.detail = "ok", time.time(), ""
+        self.gen = 0
+        self.procs = {}  # live ping subprocesses, so exit can kill them
+        self.pending, self.pending_n = (None, None, None), 0
+        self.paused = False
+        self.http_enabled = True
+        self.note = ""
+        self.baseline = {n: None for n in NAMES}
+        self.last_tick = time.time()
+
+
+def recent(st, name, k=DOWN_AFTER):
+    return [v for _, v in list(st.series[name]) if v not in ("gap", "gw")][-k:]
+
+
+def compute_mode(st):
+    """Three consecutive losses on the router or on both anchors = the path is down."""
+    def lost(seq):
+        return len(seq) == DOWN_AFTER and all(v is None for v in seq)
+    if st.route_dev is None:
+        return "no route"
+    if not st.dev or not st.gw:
+        return "no gateway"
+    if lost(recent(st, "lan")):
+        return "LAN down"
+    if lost(recent(st, "wan1")) and lost(recent(st, "wan2")):
+        return "uplink down"
+    if all(st.http_fail[n] >= 2 for n in HTTP):
+        return "HTTP blocked"
+    return "ok"
+
+
+def median(values):
+    values = sorted(v for v in values if isinstance(v, (int, float)))
+    if not values:
+        return None
+    mid = len(values) // 2
+    return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+
+
+def kill(proc):
+    if proc:
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        except OSError:
+            pass
+
+
+def pinger(name, st, stop):
+    proc = None
+    gen = -1
+    while not stop.is_set():
+        with st.lock:
+            paused, gen_now = st.paused, st.gen
+            target = st.gw if name == "lan" else ADDR[name]
+        if paused or not target:
+            kill(proc)
+            proc = None
+            stop.wait(0.3)
+            continue
+        if proc is None or gen != gen_now:
+            kill(proc)
+            gen = gen_now
+            proc = subprocess.Popen([PING, "-i", "1", "-W", "900", target],
+                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    text=True, bufsize=1)
+            with st.lock:
+                st.procs[name] = proc
+        line = proc.stdout.readline()
+        if not line:
+            proc, gen = None, -1
+            continue
+        m = re.search(r"time=([\d.]+)", line)
+        if m:
+            value = float(m.group(1))
+        elif "timeout" in line or "No route" in line or "sendto" in line:
+            value = None
+        else:
+            continue
+        with st.lock:
+            st.series[name].append((time.time(), value))
+
+
+def http_probe(st, stop):
+    ctx = ssl.create_default_context()  # shortcut: one 204 per endpoint per 30s, TTFB only,
+    # it says the path works, not how much bandwidth it has - use 't' for throughput
+    while not stop.is_set():
+        for name, (host, path) in HTTP.items():
+            if st.paused:
+                stop.wait(0.5)
+                continue
+            value = None
+            try:
+                conn = http.client.HTTPSConnection(host, timeout=5, context=ctx)
+                t0 = time.time()
+                conn.request("GET", path)
+                resp = conn.getresponse()
+                value = (time.time() - t0) * 1000 if resp.status == 204 else None
+                resp.read()
+                conn.close()
+            except (OSError, http.client.HTTPException):
+                value = None
+            with st.lock:
+                st.series[name].append((time.time(), value))
+                st.http_fail[name] = 0 if value is not None else st.http_fail[name] + 1
+        stop.wait(30)
+
+
+def persist(st):
+    cutoff = time.time() - 86400
+    with st.lock:
+        for name in NAMES:
+            agg = {}
+            for ts, v in list(st.series[name]):
+                minute = int(ts // 60) * 60
+                if minute < cutoff:
+                    continue
+                acc = agg.setdefault(minute, [0.0, 0, 0])
+                if isinstance(v, (int, float)):
+                    acc[0] += v
+                    acc[1] += 1
+                elif v is None:
+                    acc[2] += 1
+            # the ring covers the last hour, so re-deriving only those minutes is enough
+            # shortcut: a restart mid-minute rewrites that minute with a partial count;
+            # harmless for a trend view, revisit if the 24h band ever needs exact totals
+            st.minutes[name].update({m: [round(s, 2), n, l] for m, (s, n, l) in agg.items()})
+            st.minutes[name] = {m: v for m, v in st.minutes[name].items() if m >= cutoff}
+        snapshot = {n: st.minutes[n] for n in NAMES}
+    try:
+        HIST.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(snapshot, separators=(",", ":"))
+        if payload == persist.last:
+            return
+        persist.last = payload
+        tmp = HIST.with_suffix(".tmp")
+        tmp.write_text(payload)
+        os.replace(tmp, HIST)
+    except OSError:
+        pass
+
+
+persist.last = None
+
+
+def ts_exit_node():
+    raw = run([TS_BIN, "status", "--json"], timeout=5)
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        node = (data.get("ExitNodeStatus") or {}).get("ID")
+        if node:
+            for peer in (data.get("Peer") or {}).values():
+                if peer.get("ID") == node:
+                    return peer.get("HostName")
+    except (ValueError, AttributeError):
+        pass
+    return None
+
+
+def clock(st, stop):
+    last_resolve = 0.0
+    last_persist = 0.0
+    last_ts = 0.0
+    while not stop.is_set():
+        now = time.time()
+        with st.lock:
+            gap = now - st.last_tick
+            if gap > 5:
+                for name in HOPS:
+                    st.series[name].append((now, "gap"))
+                st.gen += 1
+                log(f"gap {gap:.0f}s (sleep/suspend)")
+            st.last_tick = now
+
+        if now - last_resolve >= RESOLVE_EVERY:
+            last_resolve = now
+            dev, gw, route_dev = resolve()
+            ip = run(["ipconfig", "getifaddr", dev]).strip() if dev else ""
+            with st.lock:
+                if (dev, gw, route_dev) != (st.dev, st.gw, st.route_dev):
+                    if (dev, gw, route_dev) == st.pending:
+                        st.pending_n += 1
+                    else:
+                        st.pending, st.pending_n = (dev, gw, route_dev), 1
+                    if st.pending_n >= CONFIRM:
+                        old = f"{st.route_dev}/{st.gw}"
+                        st.dev, st.gw, st.route_dev, st.ip = dev, gw, route_dev, ip
+                        st.pending, st.pending_n = (None, None, None), 0
+                        for name in HOPS:
+                            st.series[name].append((now, "gw"))
+                        st.gen += 1
+                        log(f"network change {old} -> {route_dev}/{gw} via {dev}")
+                else:
+                    st.pending, st.pending_n, st.ip = (None, None, None), 0, ip
+
+        if now - last_ts >= 30:
+            last_ts = now
+            exit_node = ts_exit_node()
+            with st.lock:
+                st.ts_exit = exit_node
+
+        with st.lock:
+            mode = compute_mode(st)
+            if mode != st.mode:
+                st.mode, st.since = mode, now
+                st.detail = f"route={st.route_dev or '-'} gw={st.dev or '-'}/{st.gw or '-'}"
+                log(f"state {mode} ({st.detail})")
+            for name in NAMES:
+                st.baseline[name] = median(
+                    v for ts, v in list(st.series[name]) if now - ts <= 3600)
+
+        if now - last_persist >= 10:
+            last_persist = now
+            persist(st)
+        stop.wait(1)
+
+
+def start_threads(st, stop, use_http=True):
+    st.http_enabled = use_http
+    load_history(st)
+    threads = [threading.Thread(target=clock, args=(st, stop), daemon=True)]
+    threads += [threading.Thread(target=pinger, args=(n, st, stop), daemon=True) for n in HOPS]
+    if use_http:
+        threads.append(threading.Thread(target=http_probe, args=(st, stop), daemon=True))
+    for t in threads:
+        t.start()
+
+
+def load_history(st):
+    try:
+        data = json.loads(HIST.read_text())
+    except (OSError, ValueError):
+        return
+    with st.lock:
+        for name in NAMES:
+            st.minutes[name] = {int(m): v for m, v in (data.get(name) or {}).items()}
+
+
+def bucketize(points, now, window, cols):
+    """(median, peak, lost) per time bucket: colour follows the typical value, a peak above
+    the red threshold still turns that dot red, so spikes are not averaged away."""
+    start = now - window
+    acc = [([], None, False, None) for _ in range(cols)]
+    for ts, value in points:
+        if ts < start:
+            continue
+        i = min(cols - 1, int((ts - start) / window * cols))
+        values, peak, lost, mark = acc[i]
+        if value in ("gw", "gap"):
+            acc[i] = (values, peak, lost, value)
+        elif value is None:
+            acc[i] = (values, peak, True, mark)
+        else:
+            values.append(value)
+            acc[i] = (values, value if peak is None else max(peak, value), lost, mark)
+    out = []
+    for values, peak, lost, mark in acc:
+        if mark:
+            out.append((mark, None, None))
+        elif lost:
+            out.append((None, peak, None))
+        elif values:
+            values.sort()
+            mid = len(values) // 2
+            med = values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+            out.append((med, peak, None))
+        else:
+            out.append(("", None, None))
+    return out
+
+
+def severity(value, cls):
+    if value == "":
+        return -1
+    if value is None:
+        return 4
+    limits = BINS[cls]
+    if value <= limits[0]:
+        return 0
+    if value <= limits[1]:
+        return 1
+    if value <= limits[2]:
+        return 2
+    return 3
+
+
+def points_for(st, name, now, window):
+    if window < 86400:
+        return list(st.series[name])
+    return [(m, (v[0] / v[1]) if v[1] else None)
+            for m, v in sorted(st.minutes[name].items()) if now - m <= 86400]
+
+
+def fmt_ms(value):
+    return "-" if not isinstance(value, (int, float)) else f"{value:.0f}ms"
+
+
+def sparkline(scr, y, x, st, name, now, window, cols, ascii_mode):
+    glyphs = ASCII_GLYPHS if ascii_mode else GLYPHS
+    cls = cls_of(name)
+    for i, (value, peak, _) in enumerate(
+            bucketize(points_for(st, name, now, window), now, window, cols)):
+        if value == "gw":
+            ch, pair = ("|" if ascii_mode else "\u2502"), 5
+        elif value == "gap":
+            ch, pair = "~", 5
+        elif value is None:
+            ch, pair = "x", 4
+        elif value == "":
+            ch, pair = " ", 0
+        else:
+            sev = severity(value, cls)
+            if peak is not None and peak > BINS[cls][2]:
+                sev = 3
+            ch, pair = glyphs[sev], sev + 1
+        if x + i < scr.getmaxyx()[1]:
+            scr.addnstr(y, x + i, ch, 1, curses.color_pair(pair) | (curses.A_BOLD if pair == 4 else 0))
+
+
+def row_stats(st, name, now):
+    window = 300 if name in HTTP else 60
+    points = [v for ts, v in list(st.series[name]) if now - ts <= window and v not in ("gap", "gw")]
+    current = points[-1] if points else None
+    loss = 100.0 * sum(1 for v in points if v is None) / len(points) if points else 0.0
+    base = st.baseline.get(name)
+    delta = (current - base) if current is not None and base is not None else None
+    return current, loss, delta
+
+
+def draw(scr, st, zoom, ascii_mode, help_on):
+    scr.erase()
+    height, width = scr.getmaxyx()
+    if height < 10 or width < 40:
+        scr.addnstr(0, 0, "pingr: terminal too small (need 40x10)", width - 1)
+        scr.refresh()
+        return
+    now = time.time()
+    with st.lock:
+        mode, since, detail = st.mode, st.since, st.detail
+        dev, gw, ip, ts_exit, route_dev = st.dev, st.gw, st.ip, st.ts_exit, st.route_dev
+        note, paused = st.note, st.paused
+        names = NAMES if st.http_enabled else HOPS
+
+    header = f"pingr {time.strftime('%H:%M:%S')}  {dev or '-'} {ip or '-'}  gw {gw or '-'}"
+    if route_dev:
+        header += f"  route {route_dev}"
+    if ts_exit:
+        header += f"  ts exit {ts_exit}"
+    scr.addnstr(0, 0, header, width - 1, curses.A_BOLD)
+
+    if mode == "ok":
+        text, pair = f"ok  {detail}", 1
+    else:
+        text = (f"{mode} since {time.strftime('%H:%M:%S', time.localtime(since))} "
+                f"({int(now - since)}s) - {detail}")
+        pair = 4
+    scr.addnstr(1, 0, text, width - 1, curses.color_pair(pair))
+
+    labels = {"lan": "lan", "wan1": "wan1", "wan2": "wan2",
+              "gstatic": "http1", "cloudflare": "http2"}
+    graph_x = 46
+    cols = max(8, width - graph_x - 1)
+    y = 3
+    for name in names:
+        with st.lock:
+            current, loss, delta = row_stats(st, name, now)
+            addr = (gw or "-") if name == "lan" else (
+                ADDR.get(name) or HTTP[name][0])
+        delta_text = "" if delta is None else f"{delta:+.0f}ms"
+        meta = f"{labels[name]:<6}{addr[:16]:<16}{fmt_ms(current):>7}{delta_text:>8}{loss:>5.0f}%  "
+        scr.addnstr(y, 0, meta, graph_x - 1)
+        sparkline(scr, y, graph_x, st, name, now, ZOOMS[zoom][0], cols, ascii_mode)
+        y += 1
+
+    alt_y = max(y + 1, height - 5)
+    if height >= y + 7:
+        with st.lock:
+            worst = max(names, key=lambda n: (row_stats(st, n, now)[1],
+                                              sum(1 for v in list(st.series[n])[-60:] if v is not None)))
+        for i, other in enumerate([i for i in range(3) if i != zoom]):
+            row = alt_y + i
+            scr.addnstr(row, 0, f"{ZOOMS[other][1]:<6}{labels[worst]:>6} ",
+                        graph_x - 1, curses.A_DIM)
+            sparkline(scr, row, graph_x, st, worst, now, ZOOMS[other][0], min(cols, 60), ascii_mode)
+
+    if help_on:
+        scr.addnstr(height - 3, 0, "1/2/3 zoom: 10m/s = per second, 1h/m = per minute, "
+                                   "24h/h = per hour.  x = lost, | = network changed, "
+                                   "~ = sleep gap", width - 1)
+    if note:
+        scr.addnstr(height - 2, 0, note[:width - 1], width - 1, curses.color_pair(5))
+    footer = "1 2 3 zoom  t throughput  s ts-path  p pause  r re-resolve  ? help  q quit"
+    scr.addnstr(height - 1, 0, ("paused  " if paused else "") + footer, width - 1, curses.A_DIM)
+    scr.refresh()
+
+
+def action_key(st, key, zoom, help_on):
+    if key in (ord("q"), ord("Q"), 27):
+        return False
+    if key in (ord("1"), ord("2"), ord("3")):
+        zoom = key - ord("1")
+    elif key == ord("p"):
+        with st.lock:
+            st.paused = not st.paused
+        log("paused" if st.paused else "resumed")
+    elif key == ord("r"):
+        with st.lock:
+            st.pending, st.pending_n = (None, None, None), 0
+        st.gen += 1
+    elif key == ord("?"):
+        help_on = not help_on
+    elif key == ord("t"):
+        st.note = "throughput test running (10 MB)..."
+        threading.Thread(target=throughput, args=(st,), daemon=True).start()
+    elif key == ord("s"):
+        st.note = "tailscale path check running..."
+        threading.Thread(target=ts_ping, args=(st,), daemon=True).start()
+    return zoom, help_on
+
+
+def throughput(st):
+    try:
+        conn = http.client.HTTPSConnection("speed.cloudflare.com", timeout=60)
+        t0 = time.time()
+        conn.request("GET", "/__down?bytes=10000000")
+        resp = conn.getresponse()
+        size = 0
+        while True:
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            size += len(chunk)
+        elapsed = time.time() - t0
+        st.note = f"throughput {size * 8 / elapsed / 1e6:.1f} Mbps ({size / 1e6:.1f} MB in {elapsed:.1f}s)"
+        log(st.note)
+    except (OSError, http.client.HTTPException) as exc:
+        st.note = f"throughput failed: {exc}"
+
+
+def ts_ping(st):
+    with st.lock:
+        name = st.ts_exit
+    if not name:
+        st.note = "no tailscale exit node in use"
+        return
+    out = run([TS_BIN, "ping", "-c", "3", name], timeout=20)
+    lines = [line for line in out.strip().splitlines() if line]
+    st.note = lines[-1][:200] if lines else "no reply"
+    log(f"ts ping {name}: {st.note}")
+
+
+def curses_main(st, zoom, ascii_mode):
+    def loop(scr):
+        curses.curs_set(0)
+        scr.nodelay(True)
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+            for pair, colour in ((1, curses.COLOR_GREEN), (2, curses.COLOR_YELLOW),
+                                 (3, curses.COLOR_MAGENTA), (4, curses.COLOR_RED),
+                                 (5, curses.COLOR_CYAN), (6, curses.COLOR_BLUE)):
+                curses.init_pair(pair, colour, -1)
+        except curses.error:
+            pass
+        help_on = False
+        z = zoom
+        while True:
+            draw(scr, st, z, ascii_mode, help_on)
+            key = scr.getch()
+            while key != -1:
+                result = action_key(st, key, z, help_on)
+                if result is False:
+                    return
+                z, help_on = result
+                key = scr.getch()
+            time.sleep(0.2)
+
+    try:
+        curses.wrapper(loop)
+    except KeyboardInterrupt:
+        pass
+
+
+def headless(st, stop):
+    seen = None
+    print("pingr: watching; printing only state changes (Ctrl-C to stop)")
+    while not stop.is_set():
+        with st.lock:
+            mode, detail = st.mode, st.detail
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {mode}  {detail}"
+        if mode != seen:
+            print(line, flush=True)
+            seen = mode
+        time.sleep(0.5)
+
+
+def snapshot(use_http):
+    dev, gw, route_dev = resolve()
+    rows = [("lan", gw or "-"), ("wan1", "1.1.1.1"), ("wan2", "9.9.9.9")]
+    if use_http:
+        rows += [(n, HTTP[n][0]) for n in HTTP]
+    results, bad = [], False
+    for name, addr in rows:
+        if addr == "-":
+            results.append((name, addr, None))
+            bad = True
+            continue
+        if name in HTTP:
+            value = None
+            try:
+                conn = http.client.HTTPSConnection(addr, timeout=5)
+                t0 = time.time()
+                conn.request("GET", HTTP[name][1])
+                resp = conn.getresponse()
+                value = (time.time() - t0) * 1000 if resp.status == 204 else None
+                resp.read()
+                conn.close()
+            except (OSError, http.client.HTTPException):
+                pass
+        else:
+            out = run([PING, "-c", "1", "-W", "900", addr], timeout=3)
+            m = re.search(r"time=([\d.]+)", out)
+            value = float(m.group(1)) if m else None
+        bad = bad or value is None
+        results.append((name, addr, value))
+    for name, addr, value in results:
+        print(f"{name:<10} {addr:<21}{fmt_ms(value):>8}")
+    print(f"route {route_dev or '-'}  gw {dev or '-'}/{gw or '-'}")
+    return 0 if not bad else 1
+
+
+def selftest():
+    now = 1000.0
+    pts = [(now - 590, 5.0), (now - 300, None), (now - 10, 40.0), (now - 5, "gw")]
+    line = bucketize(pts, now, 600, 6)
+    assert len(line) == 6
+    assert line[0][0] == 5.0 and line[1][0] == "" and line[3][0] is None and line[5][0] == "gw"
+    assert bucketize([(now - 1, 5.0), (now, 400.0)], now, 600, 1)[0][0] == 202.5
+    assert severity("", "lan") == -1 and severity(None, "lan") == 4
+    assert severity(5, "lan") == 0 and severity(100, "lan") == 2 and severity(500, "lan") == 3
+    st = State()
+    st.dev, st.gw, st.route_dev = "en0", "192.168.1.1", "en0"
+    st.series["lan"].extend([(now - 3 + i, None) for i in range(3)])
+    assert compute_mode(st) == "LAN down"
+    st.series["lan"].append((now, 5.0))
+    assert compute_mode(st) == "ok"
+    st.gw = None
+    assert compute_mode(st) == "no gateway"
+    assert bucketize([(now, 10.0)], now, 60, 3)[2][0] == 10.0
+    print("selftest ok")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="pingr", description="one-screen network monitor")
+    parser.add_argument("-q", "--quiet", action="store_true", help="state changes only")
+    parser.add_argument("-1", "--once", action="store_true", help="single snapshot, then exit")
+    parser.add_argument("--ascii", action="store_true", help="ASCII glyphs")
+    parser.add_argument("--no-http", action="store_true", help="skip the 204 probes")
+    parser.add_argument("--selftest", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.selftest:
+        selftest()
+        return 0
+    if args.once:
+        return snapshot(not args.no_http)
+
+    st = State()
+    st.dev, st.gw, st.route_dev = resolve()
+    st.ip = run(["ipconfig", "getifaddr", st.dev]).strip() if st.dev else ""
+    st.detail = f"route={st.route_dev or '-'} gw={st.dev or '-'}/{st.gw or '-'}"
+    st.mode = compute_mode(st)
+    stop = threading.Event()
+    headless_mode = args.quiet or not sys.stdout.isatty()
+    try:
+        start_threads(st, stop, use_http=not args.no_http)
+        if headless_mode:
+            headless(st, stop)
+        else:
+            curses_main(st, 0, args.ascii)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        with st.lock:
+            procs = list(st.procs.values())
+        for proc in procs:
+            kill(proc)
+        persist(st)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
