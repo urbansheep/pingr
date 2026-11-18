@@ -60,6 +60,8 @@ containing a peak above the red bin is drawn red anyway, so spikes are never ave
 | `│` | network parameters changed here |
 | `~` | sample gap > 5 s (sleep/suspend), not an outage |
 
+The footer repeats these glyphs as a legend, each in its graph colour.
+
 ## States
 
 | state | condition |
