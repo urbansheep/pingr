@@ -486,11 +486,20 @@ def draw(scr, st, zoom, ascii_mode, help_on):
     if note:
         scr.addnstr(height - 2, 0, note[:width - 1], width - 1, curses.color_pair(5))
     else:
-        glyphs_key = ". : + !" if ascii_mode else ". o O @"
-        bar = "│" if not ascii_mode else "|"
-        legend = (f"{glyphs_key} latency low-high   x lost   {bar} network change   "
-                  "~ sleep gap")
-        scr.addnstr(height - 2, 0, legend[:width - 1], width - 1, curses.A_DIM)
+        g = ASCII_GLYPHS if ascii_mode else GLYPHS
+        bar = "|" if ascii_mode else "│"
+        # same pairs as the graph: green/yellow/magenta/red glyphs, bold red x, cyan markers
+        segs = [(g[0] + " ", 1), (g[1] + " ", 2), (g[2] + " ", 3), (g[3] + " ", 4),
+                ("latency low-high   ", 0), ("x lost   ", 4),
+                (bar + " network change   ~ sleep gap", 5)]
+        x = 0
+        for text, pair in segs:
+            attr = curses.A_DIM if pair == 0 else curses.color_pair(pair)
+            if pair == 4:
+                attr |= curses.A_BOLD
+            if x < width - 1:
+                scr.addnstr(height - 2, x, text, width - 1 - x, attr)
+            x += len(text)
     footer = "1 2 3 zoom  t throughput  s ts-path  p pause  r re-resolve  ? help  q quit"
     scr.addnstr(height - 1, 0, ("paused  " if paused else "") + footer, width - 1, curses.A_DIM)
     scr.refresh()
