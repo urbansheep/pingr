@@ -11,6 +11,7 @@ import http.client
 import json
 import os
 import re
+import socket
 import ssl
 import subprocess
 import sys
@@ -24,8 +25,9 @@ TS_BIN = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 LOG = Path.home() / "Library/Logs/pingr.log"
 HIST = Path.home() / "Library/Application Support/pingr/history.json"
 
-NAMES = ("lan", "wan1", "wan2", "gstatic", "cloudflare")
+NAMES = ("lan", "wan1", "wan2", "dns", "gstatic", "cloudflare")
 ADDR = {"wan1": "1.1.1.1", "wan2": "9.9.9.9"}
+DNS_HOST = "one.one.one.one"
 HTTP = {"gstatic": ("www.gstatic.com", "/generate_204"),
         "cloudflare": ("cp.cloudflare.com", "/generate_204")}
 HOPS = ("lan", "wan1", "wan2")
@@ -33,7 +35,8 @@ BINS = {"lan": (20, 60, 150), "wan": (120, 250, 500), "http": (600, 1200, 2500)}
 GLYPHS = (".", "o", "O", "@")
 ASCII_GLYPHS = (".", ":", "+", "!")
 ZOOMS = ((600, "10m/s"), (3600, "1h/m"), (86400, "24h/h"))
-MAXLEN = {"lan": 3600, "wan1": 3600, "wan2": 3600, "gstatic": 120, "cloudflare": 120}
+MAXLEN = {"lan": 3600, "wan1": 3600, "wan2": 3600, "dns": 120,
+          "gstatic": 120, "cloudflare": 120}
 DOWN_AFTER = 3          # consecutive losses before a target counts as down
 RESOLVE_EVERY = 5       # seconds between network parameter reads
 CONFIRM = 2             # identical reads needed before adopting a changed gateway
@@ -205,6 +208,24 @@ def http_probe(st, stop):
         stop.wait(30)
 
 
+def dns_probe(st, stop):
+    # shortcut: getaddrinfo has no timeout; a wedged resolver stalls this thread,
+    # never the 1 Hz samplers
+    while not stop.is_set():
+        if st.paused:
+            stop.wait(0.5)
+            continue
+        t0 = time.time()
+        try:
+            socket.getaddrinfo(DNS_HOST, 443)
+            value = (time.time() - t0) * 1000
+        except OSError:
+            value = None
+        with st.lock:
+            st.series["dns"].append((time.time(), value))
+        stop.wait(30)
+
+
 def persist(st):
     cutoff = time.time() - 86400
     with st.lock:
@@ -323,6 +344,7 @@ def start_threads(st, stop, use_http=True):
     threads += [threading.Thread(target=pinger, args=(n, st, stop), daemon=True) for n in HOPS]
     if use_http:
         threads.append(threading.Thread(target=http_probe, args=(st, stop), daemon=True))
+        threads.append(threading.Thread(target=dns_probe, args=(st, stop), daemon=True))
     for t in threads:
         t.start()
 
@@ -419,7 +441,7 @@ def sparkline(scr, y, x, st, name, now, window, cols, ascii_mode):
 
 
 def row_stats(st, name, now):
-    window = 300 if name in HTTP else 60
+    window = 300 if (name in HTTP or name == "dns") else 60
     points = [v for ts, v in list(st.series[name]) if now - ts <= window and v not in ("gap", "gw")]
     current = points[-1] if points else None
     loss = 100.0 * sum(1 for v in points if v is None) / len(points) if points else 0.0
@@ -457,7 +479,7 @@ def draw(scr, st, zoom, ascii_mode, help_on):
         pair = 4
     scr.addnstr(1, 0, text, width - 1, curses.color_pair(pair))
 
-    labels = {"lan": "lan", "wan1": "wan1", "wan2": "wan2",
+    labels = {"lan": "lan", "wan1": "wan1", "wan2": "wan2", "dns": "dns",
               "gstatic": "http1", "cloudflare": "http2"}
     graph_x = 46
     cols = max(8, width - graph_x - 1)
@@ -466,7 +488,7 @@ def draw(scr, st, zoom, ascii_mode, help_on):
         with st.lock:
             current, loss, delta = row_stats(st, name, now)
             addr = (gw or "-") if name == "lan" else (
-                ADDR.get(name) or HTTP[name][0])
+                DNS_HOST if name == "dns" else (ADDR.get(name) or HTTP[name][0]))
         delta_text = "" if delta is None else f"{delta:+.0f}ms"
         meta = f"{labels[name]:<6}{addr[:16]:<16}{fmt_ms(current):>7}{delta_text:>8}{loss:>5.0f}%  "
         scr.addnstr(y, 0, meta, graph_x - 1)
@@ -541,11 +563,15 @@ def throughput(st):
         conn.request("GET", "/__down?bytes=10000000")
         resp = conn.getresponse()
         size = 0
+        total = 10000000
         while True:
             chunk = resp.read(65536)
             if not chunk:
                 break
             size += len(chunk)
+            frac = min(size / total, 1.0)
+            bar = "█" * int(frac * 20) + "░" * (20 - int(frac * 20))
+            st.note = f"throughput [{bar}] {100 * frac:.0f}%"
         elapsed = time.time() - t0
         st.note = f"throughput {size * 8 / elapsed / 1e6:.1f} Mbps ({size / 1e6:.1f} MB in {elapsed:.1f}s)"
         log(st.note)
@@ -614,14 +640,21 @@ def snapshot(use_http):
     dev, gw, route_dev = resolve()
     rows = [("lan", gw or "-"), ("wan1", "1.1.1.1"), ("wan2", "9.9.9.9")]
     if use_http:
-        rows += [(n, HTTP[n][0]) for n in HTTP]
+        rows += [("dns", DNS_HOST)] + [(n, HTTP[n][0]) for n in HTTP]
     results, bad = [], False
     for name, addr in rows:
         if addr == "-":
             results.append((name, addr, None))
             bad = True
             continue
-        if name in HTTP:
+        if name == "dns":
+            t0 = time.time()
+            try:
+                socket.getaddrinfo(addr, 443)
+                value = (time.time() - t0) * 1000
+            except OSError:
+                value = None
+        elif name in HTTP:
             value = None
             try:
                 conn = http.client.HTTPSConnection(addr, timeout=5)

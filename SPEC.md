@@ -35,8 +35,8 @@ but needs root on macOS and crashes when the network changes.
 | 2 | Language | Python 3 + stdlib `curses`; Go/Rust rejected because ICMP needs a subprocess either way and curses is free |
 | 3 | Sampling | `/sbin/ping -i 1 -W 900` per ICMP target (macOS blocks unprivileged ICMP sockets from scripts) |
 | 4 | Self-heal | Re-resolve only; report `no route`/`no gateway` with a since-time; no privileged remediation |
-| 5 | Targets | Router + two public DNS anchors + two `generate_204` HTTP endpoints |
-| 6 | HTTP semantics | 30 s TTFB probes are a liveness/latency signal, not throughput; real throughput is a manual `t` keypress (10 MB from `speed.cloudflare.com/__down`) |
+| 5 | Targets | Router + two public ICMP anchors + two `generate_204` HTTP endpoints + one resolver lookup, all timed as rows |
+| 6 | HTTP semantics | 30 s TTFB probes are a liveness/latency signal, not throughput; real throughput is a manual `t` keypress (10 MB from `speed.cloudflare.com/__down`, footer progress bar while it runs) |
 | 7 | Layout | mtr-style rows per target, one active zoom, other zooms compressed to two bottom rows for the worst target; footer legend repeats the glyphs in their graph colours |
 | 8 | Colour | Fixed bins per target class, calibrated on real medians, plus a Δ-vs-hour-median column |
 | 9 | Persistence | Per-minute aggregates to disk (24 h), per-second history in memory (1 h) |
@@ -64,13 +64,15 @@ Four kinds of threads plus the renderer, all sharing one `State` guarded by a `L
   "terminal too small" notice instead of crashing.
 - **http_probe**: sequentially fetches both 204 endpoints every 30 s, records TTFB or `None`,
   maintains consecutive-failure counters.
+- **dns_probe**: one timed resolver lookup every 30 s, recorded like the other rows;
+  informational only, never changes the mode.
 
 ### Data model
 
 ```
 series[name] : deque[(ts, rtt | None | "gw" | "gap")]
     lan/wan1/wan2  maxlen 3600   (1 h at 1 Hz)
-    gstatic/cloudflare  maxlen 120  (1 h at 30 s)
+    dns/gstatic/cloudflare  maxlen 120  (1 h at 30 s)
 minutes[name] : {minute_epoch: [sum, count, losses]}   persisted, 24 h retention
 http_fail[name] : consecutive failed 204 probes
 dev / gw / route_dev / ip / ts_exit / mode / since / detail / gen / paused / note

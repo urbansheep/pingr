@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "pingr",
+  "project_id": "b051c7b7-a010-47bc-8285-db39f222cf34"
+}

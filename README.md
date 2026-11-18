@@ -25,14 +25,14 @@ Live command: `~/.local/bin/pingr`
 ```sh
 pingr              # full-screen monitor (falls back to -q when stdout is not a TTY)
 pingr -q           # state changes only, timestamped; also writes the log
-pingr -1           # one five-row snapshot, exits 1 if anything failed
+pingr -1           # one snapshot of all rows, exits 1 if anything failed
 pingr --ascii      # . : + ! instead of . o O @
 pingr --no-http    # ICMP only, no 204 probes (HTTP rows hidden)
 ```
 
 Keys:
 - `1` `2` `3` zoom (10 min per second · 1 h per minute · 24 h per hour)
-- `t` 10 MB throughput test
+- `t` 10 MB throughput test (footer shows a progress bar while it runs)
 - `s` – `tailscale ping` on the current exit node
 - `p` pause sampling
 - `r` restart samplers now
@@ -48,6 +48,7 @@ ok  route=tun0 gw=wlan0/192.0.2.1
 lan   192.0.2.1           14ms    +1ms    0%   ................................x
 wan1  198.51.100.1        72ms   +17ms    2%   o..o.o.o...oo.oo.oooooo.ooooo.o.x
 wan2  203.0.113.9         37ms   -23ms    2%   ooo.oooooooo.ooooooooo..o.oooooox
+dns   dns.example.net     12ms    +1ms    0%   ................................
 http1 a.example.net      334ms   +11ms    0%      . .. . .. . .. . .. . .. . .. .
 http2 b.example.net      365ms    +4ms    0%    . .. . .. . .. . .. . .. . o. .
 . o O @ latency low-high   x lost   │ network change   ~ sleep gap
@@ -83,7 +84,8 @@ Each transition logs one line and shows `since HH:MM:SS (Ns)` in the header. A s
 - ICMP: one `/sbin/ping -i 1 -W 900` process per target. macOS refuses unprivileged ICMP sockets to scripts, so ping subprocesses are the only root-free option.
 - Network parameters (`route -n get default`, `ipconfig getoption <dev> router`, hardware-port scan as fallback) are re-read every 5 s. A changed gateway/route is adopted only after two identical reads, then all pingers restart and a `│` marker is written.
 - HTTP: `GET /generate_204` against two public endpoints every 30 s, measuring time-to-first-byte. That says the path works, not how fast it is.
-- Throughput on demand: 10 MB from `speed.cloudflare.com` (`/__down?bytes=10000000`), reported as Mbps in the footer.
+- DNS: one resolver lookup every 30 s, timed like the other rows. Slow or failing DNS shows here even when pings fly.
+- Throughput on demand: 10 MB from `speed.cloudflare.com` (`/__down?bytes=10000000`), reported as Mbps in the footer, with a progress bar while it runs.
 
 ## Files
 
