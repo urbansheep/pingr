@@ -51,10 +51,13 @@ wan2  203.0.113.9         37ms   -23ms    2%   ooo.oooooooo.ooooooooo..o.oooooox
 dns   dns.example.net     12ms    +1ms    0%   ................................
 http1 a.example.net      334ms   +11ms    0%      . .. . .. . .. . .. . .. . .. .
 http2 b.example.net      365ms    +4ms    0%    . .. . .. . .. . .. . .. . o. .
+ts online 2
+ts    urbansheep-vu      104ms    +3ms    0%   ...................o.......
+ts    tenc-urbansheep   227ms    -2ms    0%   ..............o............
 . o O @ latency low-high   x lost   │ network change   ~ sleep gap
 ```
 
-Per row: current sample, Δ against the last hour's median, loss over 60 s (300 s for HTTP), then the history band for the active zoom. The two inactive zoom levels are shown at the bottom for whichever target is currently worst.
+Per row: current sample, Δ against the last hour's median, loss over 60 s (300 s for HTTP, DNS and TS hosts), then the history band for the active zoom. The two inactive zoom levels are shown at the bottom for whichever target is currently worst.
 
 Colour follows the **median** of each time bucket against per-class bins; a bucket containing a peak above the red bin is drawn red anyway, so spikes are never averaged away.
 
@@ -85,6 +88,7 @@ Each transition logs one line and shows `since HH:MM:SS (Ns)` in the header. A s
 - Network parameters (`route -n get default`, `ipconfig getoption <dev> router`, hardware-port scan as fallback) are re-read every 5 s. A changed gateway/route is adopted only after two identical reads, then all pingers restart and a `│` marker is written.
 - HTTP: `GET /generate_204` against two public endpoints every 30 s, measuring time-to-first-byte. That says the path works, not how fast it is.
 - DNS: one resolver lookup every 30 s, timed like the other rows. Slow or failing DNS shows here even when pings fly.
+- Tailscale peers: while `tailscale status --json` lists online peers, each peer's tailnet IPv4 is pinged once every 10 s and shown as a `ts` row below the main targets, with the same loss and history band. Offline peers drop out on the next round. Informational only — a dead ts host never changes the global state.
 - Throughput on demand: 10 MB from `speed.cloudflare.com` (`/__down?bytes=10000000`), reported as Mbps in the footer, with a progress bar while it runs.
 
 ## Files

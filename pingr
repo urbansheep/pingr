@@ -40,6 +40,9 @@ MAXLEN = {"lan": 3600, "wan1": 3600, "wan2": 3600, "dns": 120,
 DOWN_AFTER = 3          # consecutive losses before a target counts as down
 RESOLVE_EVERY = 5       # seconds between network parameter reads
 CONFIRM = 2             # identical reads needed before adopting a changed gateway
+TS_EVERY = 10           # seconds between ts-host probe rounds
+TS_LEN = 120            # samples kept per ts host (20 min at 10 s)
+TS_MAX = 8              # ts hosts probed and shown at most
 
 
 def cls_of(name):
@@ -99,6 +102,7 @@ class State:
         self.http_enabled = True
         self.note = ""
         self.baseline = {n: None for n in NAMES}
+        self.ts = {}  # hostname -> deque[(ts, rtt | None)], online peers only
         self.last_tick = time.time()
 
 
@@ -226,6 +230,31 @@ def dns_probe(st, stop):
         stop.wait(30)
 
 
+def ts_probe(st, stop):
+    # shortcut: ICMP to the tailnet IPv4, one -c 1 per host per round; DERP paths
+    # can take >1 s, hence the generous wait. Immediate status read on start.
+    while not stop.is_set():
+        if st.paused:
+            stop.wait(0.5)
+            continue
+        started = time.time()
+        peers = ts_online()[:TS_MAX]
+        with st.lock:
+            for name in list(st.ts):
+                if name not in {n for n, _ in peers}:
+                    del st.ts[name]
+                    st.baseline.pop(name, None)
+        for name, addr in peers:
+            if st.paused:
+                break
+            out = run([PING, "-c", "1", "-W", "1500", addr], timeout=4)
+            m = re.search(r"time=([\d.]+)", out)
+            with st.lock:
+                st.ts.setdefault(name, deque(maxlen=TS_LEN)).append(
+                    (time.time(), float(m.group(1)) if m else None))
+        stop.wait(max(1.0, TS_EVERY - (time.time() - started)))
+
+
 def persist(st):
     cutoff = time.time() - 86400
     with st.lock:
@@ -261,6 +290,24 @@ def persist(st):
 
 
 persist.last = None
+
+
+def online_peers(data):
+    """[(hostname, ipv4)] of online peers. ICMP here is v4-only, so ignore v6-only peers."""
+    out = []
+    for peer in (data.get("Peer") or {}).values():
+        ipv4 = next((ip for ip in (peer.get("TailscaleIPs") or []) if ":" not in ip), None)
+        if peer.get("Online") and peer.get("HostName") and ipv4:
+            out.append((peer["HostName"], ipv4))
+    return sorted(out)
+
+
+def ts_online():
+    raw = run([TS_BIN, "status", "--json"], timeout=5)
+    try:
+        return online_peers(json.loads(raw)) if raw else []
+    except (ValueError, AttributeError):
+        return []
 
 
 def ts_exit_node():
@@ -330,6 +377,9 @@ def clock(st, stop):
             for name in NAMES:
                 st.baseline[name] = median(
                     v for ts, v in list(st.series[name]) if now - ts <= 3600)
+            for name in st.ts:
+                st.baseline[name] = median(
+                    v for ts, v in list(st.ts[name]) if now - ts <= 3600)
 
         if now - last_persist >= 10:
             last_persist = now
@@ -342,6 +392,7 @@ def start_threads(st, stop, use_http=True):
     load_history(st)
     threads = [threading.Thread(target=clock, args=(st, stop), daemon=True)]
     threads += [threading.Thread(target=pinger, args=(n, st, stop), daemon=True) for n in HOPS]
+    threads.append(threading.Thread(target=ts_probe, args=(st, stop), daemon=True))
     if use_http:
         threads.append(threading.Thread(target=http_probe, args=(st, stop), daemon=True))
         threads.append(threading.Thread(target=dns_probe, args=(st, stop), daemon=True))
@@ -407,9 +458,13 @@ def severity(value, cls):
     return 3
 
 
+def series_for(st, name):
+    return st.ts.get(name, st.series.get(name, ()))
+
+
 def points_for(st, name, now, window):
-    if window < 86400:
-        return list(st.series[name])
+    if name in st.ts or window < 86400:
+        return list(series_for(st, name))
     return [(m, (v[0] / v[1]) if v[1] else None)
             for m, v in sorted(st.minutes[name].items()) if now - m <= 86400]
 
@@ -440,9 +495,10 @@ def sparkline(scr, y, x, st, name, now, window, cols, ascii_mode):
             scr.addnstr(y, x + i, ch, 1, curses.color_pair(pair) | (curses.A_BOLD if pair == 4 else 0))
 
 
-def row_stats(st, name, now):
-    window = 300 if (name in HTTP or name == "dns") else 60
-    points = [v for ts, v in list(st.series[name]) if now - ts <= window and v not in ("gap", "gw")]
+def row_stats(st, name, now, window=None):
+    window = window or (300 if (name in HTTP or name == "dns") else 60)
+    points = [v for ts, v in list(series_for(st, name))
+              if now - ts <= window and v not in ("gap", "gw")]
     current = points[-1] if points else None
     loss = 100.0 * sum(1 for v in points if v is None) / len(points) if points else 0.0
     base = st.baseline.get(name)
@@ -463,6 +519,7 @@ def draw(scr, st, zoom, ascii_mode, help_on):
         dev, gw, ip, ts_exit, route_dev = st.dev, st.gw, st.ip, st.ts_exit, st.route_dev
         note, paused = st.note, st.paused
         names = NAMES if st.http_enabled else HOPS
+        ts_names = list(st.ts)[:TS_MAX]
 
     header = f"pingr {time.strftime('%H:%M:%S')}  {dev or '-'} {ip or '-'}  gw {gw or '-'}"
     if route_dev:
@@ -495,8 +552,34 @@ def draw(scr, st, zoom, ascii_mode, help_on):
         sparkline(scr, y, graph_x, st, name, now, ZOOMS[zoom][0], cols, ascii_mode)
         y += 1
 
-    alt_y = max(y + 1, height - 5)
-    if height >= y + 7:
+    if ts_names and y <= height - 7:
+        y += 1
+        scr.addnstr(y, 0, f"ts online {len(ts_names)}", width - 1, curses.A_DIM)
+        y += 1
+        for name in ts_names:
+            if y >= height - 3:
+                break
+            with st.lock:
+                current, loss, delta = row_stats(st, name, now, 300)
+            delta_text = "" if delta is None else f"{delta:+.0f}ms"
+            meta = (f"{'ts':<6}{name[:16]:<16}{fmt_ms(current):>7}"
+                    f"{delta_text:>8}{loss:>5.0f}%  ")
+            scr.addnstr(y, 0, meta, graph_x - 1)
+            sparkline(scr, y, graph_x, st, name, now, ZOOMS[zoom][0], cols, ascii_mode)
+            y += 1
+
+    bottom = height - 2          # legend line; status and help sit directly above it
+    if note:
+        bottom -= 1
+        scr.addnstr(bottom, 0, note[:width - 1], width - 1, curses.color_pair(5))
+    if help_on:
+        bottom -= 1
+        scr.addnstr(bottom, 0, "1/2/3 zoom: 10m/s = per second, 1h/m = per minute, "
+                               "24h/h = per hour.  x = lost, | = network changed, "
+                               "~ = sleep gap", width - 1)
+
+    alt_y = max(y + 1, bottom - 3)
+    if bottom >= y + 4:
         with st.lock:
             worst = max(names, key=lambda n: (row_stats(st, n, now)[1],
                                               sum(1 for v in list(st.series[n])[-60:] if v is not None)))
@@ -506,29 +589,36 @@ def draw(scr, st, zoom, ascii_mode, help_on):
                         graph_x - 1, curses.A_DIM)
             sparkline(scr, row, graph_x, st, worst, now, ZOOMS[other][0], min(cols, 60), ascii_mode)
 
-    if help_on:
-        scr.addnstr(height - 3, 0, "1/2/3 zoom: 10m/s = per second, 1h/m = per minute, "
-                                   "24h/h = per hour.  x = lost, | = network changed, "
-                                   "~ = sleep gap", width - 1)
-    if note:
-        scr.addnstr(height - 2, 0, note[:width - 1], width - 1, curses.color_pair(5))
-    else:
-        g = ASCII_GLYPHS if ascii_mode else GLYPHS
-        bar = "|" if ascii_mode else "│"
-        # same pairs as the graph: green/yellow/magenta/red glyphs, bold red x, cyan markers
-        segs = [(g[0] + " ", 1), (g[1] + " ", 2), (g[2] + " ", 3), (g[3] + " ", 4),
-                ("latency low-high   ", 0), ("x lost   ", 4),
-                (bar + " network change   ~ sleep gap", 5)]
-        x = 0
-        for text, pair in segs:
-            attr = curses.A_DIM if pair == 0 else curses.color_pair(pair)
-            if pair == 4:
-                attr |= curses.A_BOLD
-            if x < width - 1:
-                scr.addnstr(height - 2, x, text, width - 1 - x, attr)
-            x += len(text)
-    footer = "1 2 3 zoom  t throughput  s ts-path  p pause  r re-resolve  ? help  q quit"
-    scr.addnstr(height - 1, 0, ("paused  " if paused else "") + footer, width - 1, curses.A_DIM)
+    g = ASCII_GLYPHS if ascii_mode else GLYPHS
+    bar = "|" if ascii_mode else "│"
+    # same pairs as the graph: green/yellow/magenta/red glyphs, bold red x, cyan markers
+    segs = [(g[0] + " ", 1), (g[1] + " ", 2), (g[2] + " ", 3), (g[3] + " ", 4),
+            ("latency low-high   ", 0), ("x lost   ", 4),
+            (bar + " network change   ~ sleep gap", 5)]
+    x = 0
+    for text, pair in segs:
+        attr = curses.A_DIM if pair == 0 else curses.color_pair(pair)
+        if pair == 4:
+            attr |= curses.A_BOLD
+        if x < width - 1:
+            scr.addnstr(height - 2, x, text, width - 1 - x, attr)
+        x += len(text)
+
+    x = 0
+    if paused:
+        scr.addnstr(height - 1, 0, "paused  ", width - 1,
+                    curses.color_pair(2) | curses.A_BOLD)
+        x = len("paused  ")
+    for key, label in (("1 2 3", " zoom  "), ("t", " throughput  "), ("s", " ts-path  "),
+                       ("p", " pause  "), ("r", " re-resolve  "), ("?", " help  "),
+                       ("q", " quit")):
+        if x >= width - 1:
+            break
+        scr.addnstr(height - 1, x, key, width - 1 - x, curses.color_pair(5) | curses.A_BOLD)
+        x += len(key)
+        if x < width - 1:
+            scr.addnstr(height - 1, x, label, width - 1 - x, curses.A_DIM)
+        x += len(label)
     scr.refresh()
 
 
@@ -685,6 +775,11 @@ def selftest():
     assert len(line) == 6
     assert line[0][0] == 5.0 and line[1][0] == "" and line[3][0] is None and line[5][0] == "gw"
     assert bucketize([(now - 1, 5.0), (now, 400.0)], now, 600, 1)[0][0] == 202.5
+    assert online_peers({"Peer": {
+        "a": {"HostName": "up", "Online": True, "TailscaleIPs": ["fd7a::1", "100.64.0.1"]},
+        "b": {"HostName": "down", "Online": False, "TailscaleIPs": ["100.64.0.2"]},
+        "c": {"HostName": "v6only", "Online": True, "TailscaleIPs": ["fd7a::3"]},
+        "d": {"HostName": "noip", "Online": True}}}) == [("up", "100.64.0.1")]
     assert severity("", "lan") == -1 and severity(None, "lan") == 4
     assert severity(5, "lan") == 0 and severity(100, "lan") == 2 and severity(500, "lan") == 3
     st = State()

@@ -37,7 +37,7 @@ but needs root on macOS and crashes when the network changes.
 | 4 | Self-heal | Re-resolve only; report `no route`/`no gateway` with a since-time; no privileged remediation |
 | 5 | Targets | Router + two public ICMP anchors + two `generate_204` HTTP endpoints + one resolver lookup, all timed as rows |
 | 6 | HTTP semantics | 30 s TTFB probes are a liveness/latency signal, not throughput; real throughput is a manual `t` keypress (10 MB from `speed.cloudflare.com/__down`, footer progress bar while it runs) |
-| 7 | Layout | mtr-style rows per target, one active zoom, other zooms compressed to two bottom rows for the worst target; footer legend repeats the glyphs in their graph colours |
+| 7 | Layout | mtr-style rows per target, one active zoom, other zooms compressed to two bottom rows for the worst target; footer legend repeats the glyphs in their graph colours; status notes sit one line above the legend, hotkeys bold cyan against dim labels |
 | 8 | Colour | Fixed bins per target class, calibrated on real medians, plus a Δ-vs-hour-median column |
 | 9 | Persistence | Per-minute aggregates to disk (24 h), per-second history in memory (1 h) |
 | 10 | Install | `~/.local/bin/pingr`, old function deleted from both zsh files, copy in `~/scripts/pingr-legacy.zsh` |
@@ -47,10 +47,11 @@ but needs root on macOS and crashes when the network changes.
 | 14 | Keys | `1/2/3`, `t`, `s`, `p`, `r`, `?`, `q` |
 | 15 | VPN context | Header shows interface, LAN IP, router, default-route device and the Tailscale exit-node name refreshed every 30 s |
 | 16 | ts path | `tailscale ping` on demand (`s`), not periodic — it takes seconds and would fight the 1 s cadence |
+| 17 | ts hosts | While Tailscale is up, online peers are ICMP-pinged once per 10 s (`ping -c 1`) and drawn as `ts` rows under the main targets; 20 min of history, informational only, never part of the mode |
 
 ## Architecture
 
-Four kinds of threads plus the renderer, all sharing one `State` guarded by a `Lock`.
+Five kinds of threads plus the renderer, all sharing one `State` guarded by a `Lock`.
 
 - **clock** (1 Hz): detects sleep gaps, re-resolves network parameters every 5 s with a
   two-read confirmation, refreshes the Tailscale exit node every 30 s, recomputes the mode,
@@ -66,6 +67,9 @@ Four kinds of threads plus the renderer, all sharing one `State` guarded by a `L
   maintains consecutive-failure counters.
 - **dns_probe**: one timed resolver lookup every 30 s, recorded like the other rows;
   informational only, never changes the mode.
+- **ts_probe**: every 10 s reads `tailscale status --json`, drops hosts that went offline and
+  ICMP-pings each online peer's tailnet IPv4 once (`-c 1`). Unknown peers never flip the mode;
+  the list is capped at `TS_MAX`.
 
 ### Data model
 
@@ -74,6 +78,7 @@ series[name] : deque[(ts, rtt | None | "gw" | "gap")]
     lan/wan1/wan2  maxlen 3600   (1 h at 1 Hz)
     dns/gstatic/cloudflare  maxlen 120  (1 h at 30 s)
 minutes[name] : {minute_epoch: [sum, count, losses]}   persisted, 24 h retention
+ts[name] : deque[(ts, rtt | None)]   online Tailscale peers, maxlen 120 (20 min at 10 s)
 http_fail[name] : consecutive failed 204 probes
 dev / gw / route_dev / ip / ts_exit / mode / since / detail / gen / paused / note
 ```
@@ -140,7 +145,8 @@ Irrelevant for a trend view; revisit only if exact totals ever matter.
 
 ## Verification
 
-- `pingr --selftest`: bucketing (markers, loss, median, peak), severity bins, mode transitions.
+- `pingr --selftest`: bucketing (markers, loss, median, peak), severity bins, mode transitions,
+  online-peer filtering (offline, v6-only and empty-IP peers skipped).
 - `pingr -1`: five live probes, non-zero exit when any target fails.
 - pty sessions driving `1/2/3`, `t`, `s`, `p`, `?`, `r`, `q`; no tracebacks, clean exit.
 - Real measurements: 204 TTFB 280–540 ms through the Tailscale exit node, 10 MB throughput
